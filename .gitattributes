@@ -1,0 +1,3 @@
+# Verification logs intentionally preserve token trailing spaces and line endings.
+*.log binary
+*.LOG binary

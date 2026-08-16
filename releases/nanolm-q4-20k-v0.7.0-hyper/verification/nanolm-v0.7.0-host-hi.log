@@ -1,0 +1,28 @@
+START backend=NanoLM-Q4-20K prompt_tokens=7 cached=20 user=hi 
+TOKEN backend=NanoLM-Q4-20K n=1 id=12159 pos=27 text= Hi
+TOKEN backend=NanoLM-Q4-20K n=2 id=19942 pos=28 text=!
+TOKEN backend=NanoLM-Q4-20K n=3 id=654 pos=29 text= It
+TOKEN backend=NanoLM-Q4-20K n=4 id=19892 pos=30 text='
+TOKEN backend=NanoLM-Q4-20K n=5 id=19863 pos=31 text=s
+TOKEN backend=NanoLM-Q4-20K n=6 id=4585 pos=32 text= nice 
+TOKEN backend=NanoLM-Q4-20K n=7 id=298 pos=33 text= to
+TOKEN backend=NanoLM-Q4-20K n=8 id=2427 pos=34 text= meet 
+TOKEN backend=NanoLM-Q4-20K n=9 id=368 pos=35 text= you 
+TOKEN backend=NanoLM-Q4-20K n=10 id=19873 pos=36 text=. 
+TOKEN backend=NanoLM-Q4-20K n=11 id=1587 pos=37 text= Is
+TOKEN backend=NanoLM-Q4-20K n=12 id=722 pos=38 text= there
+TOKEN backend=NanoLM-Q4-20K n=13 id=1457 pos=39 text= something 
+TOKEN backend=NanoLM-Q4-20K n=14 id=315 pos=40 text= I
+TOKEN backend=NanoLM-Q4-20K n=15 id=540 pos=41 text= can
+TOKEN backend=NanoLM-Q4-20K n=16 id=1250 pos=42 text= help
+TOKEN backend=NanoLM-Q4-20K n=17 id=368 pos=43 text= you
+TOKEN backend=NanoLM-Q4-20K n=18 id=395 pos=44 text= with 
+TOKEN backend=NanoLM-Q4-20K n=19 id=19875 pos=45 text=, 
+TOKEN backend=NanoLM-Q4-20K n=20 id=442 pos=46 text= or 
+TOKEN backend=NanoLM-Q4-20K n=21 id=672 pos=47 text= would
+TOKEN backend=NanoLM-Q4-20K n=22 id=368 pos=48 text= you
+TOKEN backend=NanoLM-Q4-20K n=23 id=723 pos=49 text= like 
+TOKEN backend=NanoLM-Q4-20K n=24 id=298 pos=50 text= to 
+TOKEN backend=NanoLM-Q4-20K n=25 id=8922 pos=51 text= chat
+TOKEN backend=NanoLM-Q4-20K n=26 id=19940 pos=52 text=? 
+END backend=NanoLM-Q4-20K gen=26 pos=53 first_ms=203 total_ms=1242 sw=1477 u=11712

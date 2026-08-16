@@ -1,0 +1,9 @@
+START backend=NanoLM-Q4-20K prompt_tokens=7 cached=20 user=hi 
+TOKEN backend=NanoLM-Q4-20K n=1 id=12159 pos=27 text= Hi
+CANCEL backend=NanoLM-Q4-20K p=7/7 pos=27 l=12 s=12 gen=1 first_ms=2367 total_ms=2367 sw=307 u=2456 
+START backend=NanoLM-Q4-20K prompt_tokens=7 cached=20 user=hi 
+TOKEN backend=NanoLM-Q4-20K n=1 id=12159 pos=27 text= Hi
+CANCEL backend=NanoLM-Q4-20K p=7/7 pos=27 l=12 s=12 gen=1 first_ms=2156 total_ms=2156 sw=307 u=2456 
+START backend=NanoLM-Q4-20K prompt_tokens=7 cached=20 user=hi 
+TOKEN backend=NanoLM-Q4-20K n=1 id=12159 pos=27 text= Hi
+CANCEL backend=NanoLM-Q4-20K p=7/7 pos=27 l=12 s=12 gen=1 first_ms=1875 total_ms=1875 sw=307 u=2456 

@@ -1,0 +1,39 @@
+START backend=TinyTalk-v1 prompt_tokens=4 cached=2 user=hi
+TOKEN backend=TinyTalk-v1 n=1 id=7807 pos=6 text= Hi
+TOKEN backend=TinyTalk-v1 n=2 id=0 pos=7 text=! 
+TOKEN backend=TinyTalk-v1 n=3 id=314 pos=8 text= I
+TOKEN backend=TinyTalk-v1 n=4 id=1069 pos=9 text='m 
+TOKEN backend=TinyTalk-v1 n=5 id=6278 pos=10 text= Sarah
+TOKEN backend=TinyTalk-v1 n=6 id=13 pos=11 text=. 
+TOKEN backend=TinyTalk-v1 n=7 id=8389 pos=12 text= Nice 
+TOKEN backend=TinyTalk-v1 n=8 id=284 pos=13 text= to
+TOKEN backend=TinyTalk-v1 n=9 id=1696 pos=14 text= meet 
+TOKEN backend=TinyTalk-v1 n=10 id=345 pos=15 text= you
+TOKEN backend=TinyTalk-v1 n=11 id=0 pos=16 text=! 
+END backend=TinyTalk-v1 gen=11 pos=17 first_ms=23 total_ms=117 sw=57 u=1725 
+START backend=TinyTalk-v1 prompt_tokens=4 cached=2 user=hi
+TOKEN backend=TinyTalk-v1 n=1 id=7807 pos=6 text= Hi
+TOKEN backend=TinyTalk-v1 n=2 id=0 pos=7 text=! 
+TOKEN backend=TinyTalk-v1 n=3 id=314 pos=8 text= I
+TOKEN backend=TinyTalk-v1 n=4 id=1069 pos=9 text='m 
+TOKEN backend=TinyTalk-v1 n=5 id=6278 pos=10 text= Sarah
+TOKEN backend=TinyTalk-v1 n=6 id=13 pos=11 text=. 
+TOKEN backend=TinyTalk-v1 n=7 id=8389 pos=12 text= Nice 
+TOKEN backend=TinyTalk-v1 n=8 id=284 pos=13 text= to
+TOKEN backend=TinyTalk-v1 n=9 id=1696 pos=14 text= meet 
+TOKEN backend=TinyTalk-v1 n=10 id=345 pos=15 text= you
+TOKEN backend=TinyTalk-v1 n=11 id=0 pos=16 text=! 
+END backend=TinyTalk-v1 gen=11 pos=17 first_ms=23 total_ms=117 sw=57 u=1725 
+START backend=TinyTalk-v1 prompt_tokens=4 cached=2 user=hi
+TOKEN backend=TinyTalk-v1 n=1 id=7807 pos=6 text= Hi
+TOKEN backend=TinyTalk-v1 n=2 id=0 pos=7 text=! 
+TOKEN backend=TinyTalk-v1 n=3 id=314 pos=8 text= I
+TOKEN backend=TinyTalk-v1 n=4 id=1069 pos=9 text='m 
+TOKEN backend=TinyTalk-v1 n=5 id=6278 pos=10 text= Sarah
+TOKEN backend=TinyTalk-v1 n=6 id=13 pos=11 text=. 
+TOKEN backend=TinyTalk-v1 n=7 id=8389 pos=12 text= Nice 
+TOKEN backend=TinyTalk-v1 n=8 id=284 pos=13 text= to
+TOKEN backend=TinyTalk-v1 n=9 id=1696 pos=14 text= meet 
+TOKEN backend=TinyTalk-v1 n=10 id=345 pos=15 text= you
+TOKEN backend=TinyTalk-v1 n=11 id=0 pos=16 text=! 
+END backend=TinyTalk-v1 gen=11 pos=17 first_ms=23 total_ms=125 sw=57 u=1725 

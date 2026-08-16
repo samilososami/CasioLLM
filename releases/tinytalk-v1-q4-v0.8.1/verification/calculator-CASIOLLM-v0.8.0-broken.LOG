@@ -1,0 +1,19 @@
+START backend=TinyTalk-v1 prompt_tokens=4 cached=2 user=hi
+TOKEN backend=TinyTalk-v1 n=1 id=11 pos=6 text=,
+TOKEN backend=TinyTalk-v1 n=2 id=11 pos=7 text=,
+TOKEN backend=TinyTalk-v1 n=3 id=11 pos=8 text=,
+TOKEN backend=TinyTalk-v1 n=4 id=11 pos=9 text=,
+TOKEN backend=TinyTalk-v1 n=5 id=11 pos=10 text=, 
+TOKEN backend=TinyTalk-v1 n=6 id=11 pos=11 text=, 
+TOKEN backend=TinyTalk-v1 n=7 id=11 pos=12 text=, 
+TOKEN backend=TinyTalk-v1 n=8 id=11 pos=13 text=, 
+TOKEN backend=TinyTalk-v1 n=9 id=11 pos=14 text=, 
+CANCEL backend=TinyTalk-v1 p=4/4 pos=14 l=8 s=13 gen=9 first_ms=5710 total_ms=20320 sw=12 u=1368
+START backend=TinyTalk-v1 prompt_tokens=4 cached=2 user=hi
+TOKEN backend=TinyTalk-v1 n=1 id=11 pos=6 text=,
+TOKEN backend=TinyTalk-v1 n=2 id=11 pos=7 text=,
+TOKEN backend=TinyTalk-v1 n=3 id=11 pos=8 text=,
+TOKEN backend=TinyTalk-v1 n=4 id=11 pos=9 text=,
+TOKEN backend=TinyTalk-v1 n=5 id=11 pos=10 text=, 
+TOKEN backend=TinyTalk-v1 n=6 id=11 pos=11 text=, 
+CANCEL backend=TinyTalk-v1 p=4/4 pos=11 l=8 s=13 gen=6 first_ms=5109 total_ms=14187 sw=9 u=1011 

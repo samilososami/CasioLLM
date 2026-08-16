@@ -1,8 +1,9 @@
 /*
    Stateless, storage-streaming NanoLM runtime for the fx-CG50.
 
-   Q4 weights are never copied into RAM. Each forward pass opens NANOLM.Q4,
-   reads one projection at a time, and discards that projection after use.
+   Q4 weights are never copied into RAM. The calculator-specific CG4 stream
+   is kept open while the add-in runs, and each projection is discarded after
+   use.
    The only cache is the attention cache for the prompt currently being
    generated; nanolm_start() clears it unconditionally.
 */
@@ -29,6 +30,10 @@
 #define MAX_PROMPT_TOKENS 112
 #define MAX_RESPONSE_TOKENS 48
 #define TENSOR_COUNT 110
+#define CG4_GROUP_BYTES 36
+#ifdef CASIOLLM_NANOLM_BATCH_PREFILL
+#define PREFILL_BATCH 4
+#endif
 #ifndef IO_BUFFER_BYTES
 #define IO_BUFFER_BYTES 12000
 #endif
@@ -42,6 +47,16 @@
 #define ID_USER 2024
 #define ID_ASSISTANT 11167
 
+#ifdef CASIOLLM_NANOLM_CG4
+#ifdef CASIOLLM_NANOLM_BATCH_PREFILL
+#define NANOLM_BACKEND_LOG "NanoLM-CG4-Q4-20K-B4"
+#else
+#define NANOLM_BACKEND_LOG "NanoLM-CG4-Q4-20K"
+#endif
+#else
+#define NANOLM_BACKEND_LOG "NanoLM-Q4-20K"
+#endif
+
 typedef struct { uint32_t a, b, c, d; } entry_t;
 typedef struct {
     entry_t index[TENSOR_COUNT];
@@ -53,7 +68,9 @@ typedef struct {
        reads and 7,800 half-to-float conversions from every model token. */
     float norms[LAYERS * 2 + 1][HIDDEN];
     float rope_denominator[HEAD_DIM / 2];
+    float attention_denominator;
 #endif
+    int model_fd;
     int index_version;
     int ready;
     char error[72];
@@ -106,16 +123,52 @@ typedef struct {
     uint32_t profile_units;
     int first_token_recorded;
     int cached_tokens;
+    int user_tokens;
+    uint32_t user_token_hash;
+    int token_trace[MAX_RESPONSE_TOKENS];
     int canned_active;
     int canned_at;
     char canned_reply[96];
     char decoded[48];
 } state_t;
 
+#ifdef CASIOLLM_NANOLM_BATCH_PREFILL
+/* Prompt-only batch workspace. Four causal positions share each streamed
+   matrix read, while every dot product, normalization and attention operation
+   retains the scalar runtime's order. At decode time this workspace is idle. */
+typedef struct {
+    float x[PREFILL_BATCH][HIDDEN];
+    float xn[PREFILL_BATCH][HIDDEN];
+    float q[PREFILL_BATCH][HIDDEN];
+    float k[PREFILL_BATCH][KV_DIM];
+    float v[PREFILL_BATCH][KV_DIM];
+    float gate[PREFILL_BATCH][INTERMEDIATE];
+    int16_t xq[PREFILL_BATCH][INTERMEDIATE];
+    float xq_scale[PREFILL_BATCH];
+    float rope_cos[PREFILL_BATCH][HEAD_DIM / 2];
+    float rope_sin[PREFILL_BATCH][HEAD_DIM / 2];
+    int active;
+    int count;
+    int layer;
+    int stage;
+} prefill_t;
+#endif
+
 static assets_t assets;
 static state_t state;
+#ifdef CASIOLLM_NANOLM_BATCH_PREFILL
+static prefill_t prefill;
+#endif
 static uint8_t *io_buffer;
 static char log_buffer[160];
+#ifdef CASIOLLM_NANOLM_HYPER
+typedef uint32_t alias_u32_t __attribute__((__may_alias__));
+/* Native-endian copies of the two signed int16 values represented by each
+   packed Q4 byte. Building this once turns the hot unpack loop into one table
+   load and one aligned 32-bit store per pair without changing any value. */
+static uint32_t q4_pair_table[256];
+static int q4_pair_table_ready;
+#endif
 
 enum {
     FORWARD_PROMPT = 1,
@@ -163,6 +216,35 @@ static uint16_t le16(uint8_t const *p)
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
+#ifdef CASIOLLM_NANOLM_CG4
+static float be_f32(uint8_t const *p)
+{
+#ifdef __sh__
+    typedef float alias_float_t __attribute__((__may_alias__));
+    /* CG4 groups and the malloc-backed I/O buffer are 4-byte aligned, and the
+       calculator is big-endian, so the stored scale already has native float
+       byte order. This is the exact same bit pattern without reconstruction. */
+    return *(alias_float_t const *)(void const *)p;
+#else
+    uint32_t bits = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+        ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+#endif
+}
+
+static inline __attribute__((always_inline)) void prefetch_cg4(
+    uint8_t const *p)
+{
+#ifdef __sh__
+    __asm__ volatile("pref @%0" :: "r"(p));
+#else
+    (void)p;
+#endif
+}
+#endif
+
 #ifdef CASIOLLM_HOST_TOOLS
 static void store_le16(uint8_t *p, uint16_t value)
 {
@@ -179,7 +261,6 @@ static void store_le32(uint8_t *p, uint32_t value)
 }
 #endif
 
-#if defined(CASIOLLM_NANOLM_EXTREME) || defined(CASIOLLM_HOST_TOOLS)
 static uint32_t token_hash(int const *tokens, int count)
 {
     uint32_t hash = 2166136261U;
@@ -192,7 +273,6 @@ static uint32_t token_hash(int const *tokens, int count)
     }
     return hash;
 }
-#endif
 
 static int fill_fixed_prefix(int *out)
 {
@@ -344,6 +424,29 @@ static void log_event(char const *text)
     (void)gint_world_switch(GINT_CALL(os_append_log, 0));
 }
 
+static void log_token_trace(void)
+{
+    char line[160];
+    for(int begin = 0; begin < state.generated; begin += 12) {
+        int end = begin + 12;
+        int at;
+        if(end > state.generated) end = state.generated;
+        at = snprintf(line, sizeof(line), "TOKENS %d-%d ids=", begin + 1, end);
+        for(int i = begin; i < end && at + 8 < (int)sizeof(line); i++)
+            at += snprintf(line + at, sizeof(line) - (size_t)at,
+                "%s%d", i == begin ? "" : ",", state.token_trace[i]);
+        log_event(line);
+    }
+}
+
+static int os_close_model(int ignored)
+{
+    (void)ignored;
+    if(assets.model_fd >= 0) BFile_Close(assets.model_fd);
+    assets.model_fd = -1;
+    return 1;
+}
+
 static int os_load_assets(int ignored)
 {
     uint8_t header[56];
@@ -352,24 +455,26 @@ static int os_load_assets(int ignored)
     int header_size;
 #ifdef CASIOLLM_NANOLM_HYPER
     uint8_t norm_raw[HIDDEN * 2];
-    int model_fd;
 #endif
     (void)ignored;
+    assets.model_fd = -1;
     fd = BFile_Open(u"\\\\fls0\\NANOLM.IDX", BFile_ReadOnly);
     if(fd < 0) { set_error("Missing NANOLM.IDX"); return 0; }
     if(BFile_Read(fd, header, 24, 0) != 24 ||
        (memcmp(header, "NLMIDX01", 8) != 0 &&
-        memcmp(header, "NLMIDX02", 8) != 0) ||
+        memcmp(header, "NLMIDX02", 8) != 0 &&
+        memcmp(header, "NLMIDX03", 8) != 0) ||
        le32(header + 12) != TENSOR_COUNT ||
        le32(header + 20) != 64) {
         BFile_Close(fd); set_error("Invalid NANOLM.IDX"); return 0;
     }
-    assets.index_version = header[7] == '2' ? 2 : 1;
-    header_size = assets.index_version == 2 ? 56 : 24;
+    assets.index_version = header[7] == '3' ? 3 :
+        (header[7] == '2' ? 2 : 1);
+    header_size = assets.index_version >= 2 ? 56 : 24;
     memset(assets.model_sha256, 0, sizeof(assets.model_sha256));
-    if(assets.index_version == 2) {
+    if(assets.index_version >= 2) {
         if(BFile_Read(fd, header + 24, 32, 24) != 32) {
-            BFile_Close(fd); set_error("Cannot read NANOLM.IDX v2"); return 0;
+            BFile_Close(fd); set_error("Cannot read NANOLM.IDX digest"); return 0;
         }
         memcpy(assets.model_sha256, header + 24, 32);
     }
@@ -387,29 +492,55 @@ static int os_load_assets(int ignored)
     }
     if(assets.vocab_size != 20000) { set_error("This build needs 20K Q4"); return 0; }
 #ifdef CASIOLLM_NANOLM_HYPER
-    model_fd = BFile_Open(u"\\\\fls0\\NANOLM.Q4", BFile_ReadOnly);
-    if(model_fd < 0) { set_error("Missing NANOLM.Q4"); return 0; }
+#ifdef CASIOLLM_NANOLM_CG4
+    if(assets.index_version != 3) {
+        set_error("CG4 needs NANOLM.IDX v3");
+        return 0;
+    }
+    assets.model_fd = BFile_Open(u"\\\\fls0\\NANOLM.CG4", BFile_ReadOnly);
+    if(assets.model_fd < 0) { set_error("Missing NANOLM.CG4"); return 0; }
+    {
+        uint8_t cg4_header[8];
+        if(BFile_Read(assets.model_fd, cg4_header, sizeof(cg4_header), 0)
+                != (int)sizeof(cg4_header) ||
+           memcmp(cg4_header, "NLMCG401", 8) != 0) {
+            BFile_Close(assets.model_fd);
+            assets.model_fd = -1;
+            set_error("Invalid NANOLM.CG4");
+            return 0;
+        }
+    }
+#else
+    assets.model_fd = BFile_Open(u"\\\\fls0\\NANOLM.Q4", BFile_ReadOnly);
+    if(assets.model_fd < 0) { set_error("Missing NANOLM.Q4"); return 0; }
+#endif
     for(int slot = 0; slot < LAYERS * 2 + 1; slot++) {
         int tensor = slot == LAYERS * 2
             ? 1 + LAYERS * 9
             : 1 + (slot / 2) * 9 + ((slot & 1) ? 5 : 0);
         int offset = (int)(assets.data_base + assets.index[tensor].a);
-        if(BFile_Read(model_fd, norm_raw, sizeof(norm_raw), offset)
+        if(BFile_Read(assets.model_fd, norm_raw, sizeof(norm_raw), offset)
                 != (int)sizeof(norm_raw)) {
-            BFile_Close(model_fd);
+            BFile_Close(assets.model_fd);
+            assets.model_fd = -1;
             set_error("Cannot preload Nano norms");
             return 0;
         }
         for(int i = 0; i < HIDDEN; i++)
             assets.norms[slot][i] = f16(le16(norm_raw + i * 2));
     }
-    BFile_Close(model_fd);
     for(int i = 0; i < HEAD_DIM / 2; i++)
         assets.rope_denominator[i] =
             powf(10000.0f, (float)(2 * i) / HEAD_DIM);
+    assets.attention_denominator = sqrtf((float)HEAD_DIM);
 #endif
     io_buffer = malloc(IO_BUFFER_BYTES);
-    if(!io_buffer) { set_error("Not enough RAM for Q4 buffer"); return 0; }
+    if(!io_buffer) {
+        if(assets.model_fd >= 0) BFile_Close(assets.model_fd);
+        assets.model_fd = -1;
+        set_error("Not enough RAM for Q4 buffer");
+        return 0;
+    }
     assets.ready = 1;
     set_error("");
     return 1;
@@ -417,6 +548,18 @@ static int os_load_assets(int ignored)
 
 bool nanolm_prepare(void)
 {
+#ifdef CASIOLLM_NANOLM_HYPER
+    if(!q4_pair_table_ready) {
+        for(int packed = 0; packed < 256; packed++) {
+            int16_t pair[2] = {
+                (int16_t)((packed & 15) - 8),
+                (int16_t)((packed >> 4) - 8),
+            };
+            memcpy(&q4_pair_table[packed], pair, sizeof(pair));
+        }
+        q4_pair_table_ready = 1;
+    }
+#endif
     if(assets.ready) return true;
     return gint_world_switch(GINT_CALL(os_load_assets, 0)) == 1;
 }
@@ -430,7 +573,16 @@ typedef struct {
 
 static int trie_read(int fd, uint32_t node, trie_node_t *out)
 {
-    return BFile_Read(fd, out, sizeof(*out), 12 + (int)(node * sizeof(*out))) == (int)sizeof(*out);
+    uint8_t raw[16];
+    if(BFile_Read(fd, raw, sizeof(raw), 12 + (int)(node * sizeof(raw)))
+            != (int)sizeof(raw)) return 0;
+    out->child = le32(raw);
+    out->sibling = le32(raw + 4);
+    out->token = le16(raw + 8);
+    out->byte = raw[10];
+    out->pad = raw[11];
+    out->score = (int32_t)le32(raw + 12);
+    return 1;
 }
 
 /* Segment only while in the OS world. The trie remains external, keeping the
@@ -517,7 +669,15 @@ static int os_append_user_prompt(char const *user_prompt)
        memcmp(header, "NLMTRE01", 8) != 0) {
         BFile_Close(fd); set_error("Invalid NANOLM.TRI"); return 0;
     }
-    n += tokenize_user_os(fd, user_prompt, state.prompt + n, MAX_PROMPT_TOKENS - n - 6);
+    state.user_tokens = tokenize_user_os(fd, user_prompt, state.prompt + n,
+        MAX_PROMPT_TOKENS - n - 6);
+    if(user_prompt[0] && state.user_tokens == 0) {
+        BFile_Close(fd);
+        set_error("Tokenizer rejected prompt");
+        return 0;
+    }
+    state.user_token_hash = token_hash(state.prompt + n, state.user_tokens);
+    n += state.user_tokens;
     BFile_Close(fd);
     state.prompt[n++] = ID_IM_END; state.prompt[n++] = ID_SPACE; state.prompt[n++] = ID_NEWLINE;
     state.prompt[n++] = ID_IM_START; state.prompt[n++] = ID_ASSISTANT; state.prompt[n++] = ID_NEWLINE;
@@ -538,8 +698,8 @@ static int os_load_prefix(int ignored)
     int row_bytes = prefix_len * KV_DIM * 2;
     (void)ignored;
 
-    if(assets.index_version != 2) {
-        set_error("Nano extreme needs IDX v2");
+    if(assets.index_version < 2) {
+        set_error("Nano extreme needs IDX digest");
         return 0;
     }
     fd = BFile_Open(u"\\\\fls0\\NANOLM.PFX", BFile_ReadOnly);
@@ -586,9 +746,28 @@ static int os_load_prefix(int ignored)
 
 bool nanolm_start(char const *user_prompt)
 {
+    char normalized_prompt[81];
     char line[160];
+    size_t prompt_length;
     uint32_t request_started = rtc_ticks();
+
+    /* Keep the backend safe when it is called outside main.c as well (host
+       regression tools do this directly). Calculator-enterable prompts are
+       capped at 80 bytes, so copy once and strip only trailing ASCII spaces;
+       internal spaces remain semantically significant. */
+    prompt_length = strlen(user_prompt);
+    if(prompt_length >= sizeof(normalized_prompt))
+        prompt_length = sizeof(normalized_prompt) - 1;
+    memcpy(normalized_prompt, user_prompt, prompt_length);
+    while(prompt_length > 0 && normalized_prompt[prompt_length - 1] == ' ')
+        prompt_length--;
+    normalized_prompt[prompt_length] = '\0';
+    user_prompt = normalized_prompt;
+
     memset(&state, 0, sizeof(state));
+#ifdef CASIOLLM_NANOLM_BATCH_PREFILL
+    memset(&prefill, 0, sizeof(prefill));
+#endif
 #ifdef CASIOLLM_NANOLM_SHORT_IDENTITY
     if(select_identity_reply(user_prompt)) {
         state.active = 1;
@@ -609,8 +788,9 @@ bool nanolm_start(char const *user_prompt)
     state.active = 1;
     state.started_ticks = request_started;
     snprintf(line, sizeof(line),
-        "START backend=NanoLM-Q4-20K prompt_tokens=%d cached=%d user=%.70s",
-        state.prompt_len, state.cached_tokens, user_prompt);
+        "START backend=%s p=%d cached=%d utok=%d uhash=%08lx user=%.46s",
+        NANOLM_BACKEND_LOG, state.prompt_len, state.cached_tokens, state.user_tokens,
+        (unsigned long)state.user_token_hash, user_prompt);
     log_event(line);
     return true;
 }
@@ -677,15 +857,34 @@ static inline __attribute__((always_inline)) int32_t dot_i16_exact(
     int32_t total;
     int16_t const *w = weights;
     int16_t const *x = activation;
-    int n = count;
+    int blocks = count >> 3;
+    int tail = count & 7;
     __asm__ volatile(
         "clrmac\n\t"
+        "tst %[blocks],%[blocks]\n\t"
+        "bt 2f\n\t"
         "1:\n\t"
         "mac.w @%[w]+,@%[x]+\n\t"
-        "dt %[n]\n\t"
+        "mac.w @%[w]+,@%[x]+\n\t"
+        "mac.w @%[w]+,@%[x]+\n\t"
+        "mac.w @%[w]+,@%[x]+\n\t"
+        "mac.w @%[w]+,@%[x]+\n\t"
+        "mac.w @%[w]+,@%[x]+\n\t"
+        "mac.w @%[w]+,@%[x]+\n\t"
+        "mac.w @%[w]+,@%[x]+\n\t"
+        "dt %[blocks]\n\t"
         "bf 1b\n\t"
+        "2:\n\t"
+        "tst %[tail],%[tail]\n\t"
+        "bt 4f\n\t"
+        "3:\n\t"
+        "mac.w @%[w]+,@%[x]+\n\t"
+        "dt %[tail]\n\t"
+        "bf 3b\n\t"
+        "4:\n\t"
         "sts macl,%[total]"
-        : [w] "+r"(w), [x] "+r"(x), [n] "+r"(n),
+        : [w] "+r"(w), [x] "+r"(x), [blocks] "+r"(blocks),
+          [tail] "+r"(tail),
           [total] "=&r"(total)
         :
         : "mach", "macl", "memory");
@@ -706,8 +905,7 @@ static inline __attribute__((always_inline)) int32_t dot_q4_i16_exact(
     if((element & 1) == 0) {
         for(; at + 1 < count; at += 2) {
             uint8_t packed = quant[((element + at) >> 1) - quant_first_element / 2];
-            unpacked[at] = (int16_t)((packed & 15) - 8);
-            unpacked[at + 1] = (int16_t)((packed >> 4) - 8);
+            *(alias_u32_t *)(void *)(unpacked + at) = q4_pair_table[packed];
         }
     }
     for(; at < count; at++) {
@@ -718,6 +916,34 @@ static inline __attribute__((always_inline)) int32_t dot_q4_i16_exact(
     }
     return dot_i16_exact(unpacked, activation, count);
 }
+
+#ifdef CASIOLLM_NANOLM_CG4
+static inline __attribute__((always_inline)) void unpack_cg4_exact(
+    uint8_t const *quant, int group_offset, int count, int16_t *unpacked)
+{
+    int at = 0;
+    if((group_offset & 1) == 0) {
+        for(; at + 1 < count; at += 2) {
+            uint8_t packed = quant[(group_offset + at) >> 1];
+            *(alias_u32_t *)(void *)(unpacked + at) = q4_pair_table[packed];
+        }
+    }
+    for(; at < count; at++) {
+        int current = group_offset + at;
+        uint8_t packed = quant[current >> 1];
+        unpacked[at] = (int16_t)(((current & 1)
+            ? (packed >> 4) : (packed & 15)) - 8);
+    }
+}
+
+static inline __attribute__((always_inline)) int32_t dot_cg4_i16_exact(
+    uint8_t const *quant, int group_offset, int16_t const *activation,
+    int count, int16_t *unpacked)
+{
+    unpack_cg4_exact(quant, group_offset, count, unpacked);
+    return dot_i16_exact(unpacked, activation, count);
+}
+#endif
 #endif
 
 /* Process up to 16 storage blocks of a Q4 matrix. Activations are INT16, so
@@ -737,21 +963,34 @@ static int matvec_microstep(int fd, entry_t const *entry, int rows, int cols,
         int flat = begin * cols;
         int first_group;
         int groups;
-        int scale_bytes;
-        int quant_bytes;
-        uint8_t *scales;
-        uint8_t *quant;
+#ifdef CASIOLLM_NANOLM_CG4
+        int stream_bytes;
+#else
+        int scale_bytes, quant_bytes;
+        uint8_t *scales, *quant;
+#endif
 
         while(count > 1) {
             first_group = flat >> 6;
             groups = ((flat + count * cols - 1) >> 6) - first_group + 1;
+#ifdef CASIOLLM_NANOLM_CG4
+            stream_bytes = groups * CG4_GROUP_BYTES;
+            if(stream_bytes <= IO_BUFFER_BYTES) break;
+#else
             scale_bytes = groups * 2;
             quant_bytes = count * cols / 2;
             if(scale_bytes + quant_bytes <= IO_BUFFER_BYTES) break;
+#endif
             count--;
         }
         first_group = flat >> 6;
         groups = ((flat + count * cols - 1) >> 6) - first_group + 1;
+#ifdef CASIOLLM_NANOLM_CG4
+        stream_bytes = groups * CG4_GROUP_BYTES;
+        if(stream_bytes > IO_BUFFER_BYTES ||
+           !read_at(fd, io_buffer, stream_bytes,
+               entry->a + (uint32_t)first_group * CG4_GROUP_BYTES)) return -1;
+#else
         scale_bytes = groups * 2;
         quant_bytes = count * cols / 2;
         if(scale_bytes + quant_bytes > IO_BUFFER_BYTES) return -1;
@@ -759,6 +998,7 @@ static int matvec_microstep(int fd, entry_t const *entry, int rows, int cols,
         quant = io_buffer + scale_bytes;
         if(!read_at(fd, scales, scale_bytes, entry->a + first_group * 2) ||
            !read_at(fd, quant, quant_bytes, entry->b + flat / 2)) return -1;
+#endif
 
         for(int local = 0; local < count; local++) {
             int row = begin + local;
@@ -771,8 +1011,20 @@ static int matvec_microstep(int fd, entry_t const *entry, int rows, int cols,
                 int32_t subtotal = 0;
                 if(take > cols - col) take = cols - col;
 #ifdef CASIOLLM_NANOLM_HYPER
+#ifdef CASIOLLM_NANOLM_CG4
+                {
+                    uint8_t const *group_data = io_buffer +
+                        (group - first_group) * CG4_GROUP_BYTES;
+                    if(group - first_group + 1 < groups)
+                        prefetch_cg4(group_data + CG4_GROUP_BYTES);
+                    subtotal = dot_cg4_i16_exact(group_data + 4,
+                        element & 63, x + col, take, unpacked);
+                    total += (float)subtotal * be_f32(group_data);
+                }
+#else
                 subtotal = dot_q4_i16_exact(quant, flat, element,
                     x + col, take, unpacked);
+#endif
 #else
                 for(int j = 0; j < take; j++) {
                     int current = element + j;
@@ -781,8 +1033,10 @@ static int matvec_microstep(int fd, entry_t const *entry, int rows, int cols,
                     subtotal += q * (int32_t)x[col + j];
                 }
 #endif
+#ifndef CASIOLLM_NANOLM_CG4
                 total += (float)subtotal *
                     f16(le16(scales + (group - first_group) * 2));
+#endif
                 col += take;
             }
             out[row] = total * x_scale;
@@ -794,28 +1048,118 @@ static int matvec_microstep(int fd, entry_t const *entry, int rows, int cols,
     return begin >= rows ? 1 : 0;
 }
 
+#if defined(CASIOLLM_NANOLM_BATCH_PREFILL) && defined(CASIOLLM_NANOLM_CG4)
+/* Apply one streamed matrix to every prompt position in the current batch.
+   The packed weights are read and unpacked once, but each scalar dot product
+   and each floating-point accumulation keeps the exact single-token order. */
+static int matvec_prefill_batch(int fd, entry_t const *entry, int rows, int cols,
+    float *out, int out_stride, int fuse_silu_up)
+{
+    int begin = 0;
+    int16_t unpacked[64];
+
+    while(begin < rows) {
+        int count = rows - begin;
+        int flat = begin * cols;
+        int first_group;
+        int groups;
+        int stream_bytes;
+
+        while(count > 1) {
+            first_group = flat >> 6;
+            groups = ((flat + count * cols - 1) >> 6) - first_group + 1;
+            stream_bytes = groups * CG4_GROUP_BYTES;
+            if(stream_bytes <= IO_BUFFER_BYTES) break;
+            count--;
+        }
+        first_group = flat >> 6;
+        groups = ((flat + count * cols - 1) >> 6) - first_group + 1;
+        stream_bytes = groups * CG4_GROUP_BYTES;
+        if(stream_bytes > IO_BUFFER_BYTES ||
+           !read_at(fd, io_buffer, stream_bytes,
+               entry->a + (uint32_t)first_group * CG4_GROUP_BYTES)) return 0;
+
+        for(int local = 0; local < count; local++) {
+            int row = begin + local;
+            int col = 0;
+            float totals[PREFILL_BATCH] = { 0.0f };
+            while(col < cols) {
+                int element = row * cols + col;
+                int group = element >> 6;
+                int take = 64 - (element & 63);
+                uint8_t const *group_data;
+                float weight_scale;
+                if(take > cols - col) take = cols - col;
+                group_data = io_buffer +
+                    (group - first_group) * CG4_GROUP_BYTES;
+                if(group - first_group + 1 < groups)
+                    prefetch_cg4(group_data + CG4_GROUP_BYTES);
+                weight_scale = be_f32(group_data);
+                unpack_cg4_exact(group_data + 4, element & 63, take, unpacked);
+                for(int batch = 0; batch < prefill.count; batch++) {
+                    int32_t subtotal = dot_i16_exact(unpacked,
+                        prefill.xq[batch] + col, take);
+                    totals[batch] += (float)subtotal * weight_scale;
+                }
+                col += take;
+            }
+            for(int batch = 0; batch < prefill.count; batch++) {
+                float value = totals[batch] * prefill.xq_scale[batch];
+                float *destination = out + batch * out_stride + row;
+                if(fuse_silu_up) {
+                    float gate = *destination;
+                    *destination = gate / (1.0f + expf(-gate)) * value;
+                }
+                else *destination = value;
+            }
+        }
+        begin += count;
+    }
+    return 1;
+}
+#endif
+
 static int embedding(int fd, int token, float *out)
 {
     entry_t const *entry = &assets.index[0];
     int start = token * HIDDEN;
     int first_group = start >> 6;
     int groups = ((start + HIDDEN - 1) >> 6) - first_group + 1;
+#ifdef CASIOLLM_NANOLM_CG4
+    uint8_t groups_data[6 * CG4_GROUP_BYTES];
+#else
     uint8_t scales[12];
     uint8_t quant[160];
     int first_byte = start >> 1;
+#endif
+#ifdef CASIOLLM_NANOLM_CG4
+    if(token < 0 || token >= 20000 ||
+       !read_at(fd, groups_data, groups * CG4_GROUP_BYTES,
+           entry->a + (uint32_t)first_group * CG4_GROUP_BYTES)) return 0;
+#else
     if(token < 0 || token >= 20000 ||
        !read_at(fd, scales, groups * 2, entry->a + first_group * 2) ||
        !read_at(fd, quant, 156 + (start & 1), entry->b + first_byte)) return 0;
+#endif
     for(int i = 0; i < HIDDEN; i++) {
         int flat = start + i;
+#ifdef CASIOLLM_NANOLM_CG4
+        uint8_t const *group_data = groups_data +
+            ((flat >> 6) - first_group) * CG4_GROUP_BYTES;
+        int group_offset = flat & 63;
+        uint8_t packed = group_data[4 + (group_offset >> 1)];
+        int q = ((group_offset & 1) ? (packed >> 4) : (packed & 15)) - 8;
+        out[i] = (float)q * be_f32(group_data);
+#else
         uint8_t packed = quant[(flat >> 1) - first_byte];
         int q = ((flat & 1) ? (packed >> 4) : (packed & 15)) - 8;
         out[i] = (float)q * f16(le16(scales + ((flat >> 6) - first_group) * 2));
+#endif
     }
     return 1;
 }
 
-static void prepare_rope(int position)
+static void prepare_rope_to(int position, float *cos_values, float *sin_values)
 {
     for(int i = 0; i < HEAD_DIM / 2; i++) {
 #ifdef CASIOLLM_NANOLM_HYPER
@@ -824,16 +1168,22 @@ static void prepare_rope(int position)
         float theta = (float)position /
             powf(10000.0f, (float)(2 * i) / HEAD_DIM);
 #endif
-        state.rope_cos[i] = cosf(theta);
-        state.rope_sin[i] = sinf(theta);
+        cos_values[i] = cosf(theta);
+        sin_values[i] = sinf(theta);
     }
 }
 
-static void apply_rope(float *vector, int heads)
+static void prepare_rope(int position)
+{
+    prepare_rope_to(position, state.rope_cos, state.rope_sin);
+}
+
+static void apply_rope_values(float *vector, int heads,
+    float const *cos_values, float const *sin_values)
 {
     for(int i = 0; i < HEAD_DIM / 2; i++) {
-        float c = state.rope_cos[i];
-        float s = state.rope_sin[i];
+        float c = cos_values[i];
+        float s = sin_values[i];
         for(int h = 0; h < heads; h++) {
             float *v = vector + h * HEAD_DIM;
             float a = v[i], b = v[i + HEAD_DIM / 2];
@@ -842,6 +1192,53 @@ static void apply_rope(float *vector, int heads)
         }
     }
 }
+
+static void apply_rope(float *vector, int heads)
+{
+    apply_rope_values(vector, heads, state.rope_cos, state.rope_sin);
+}
+
+#ifdef CASIOLLM_NANOLM_HYPER
+static void attention_hyper_compute(int layer, int position,
+    float const *query_values, float *output)
+{
+    float scores[MAX_CONTEXT];
+    for(int kv_head = 0; kv_head < KV_HEADS; kv_head++) {
+        for(int t = 0; t <= position; t++) {
+            for(int d = 0; d < HEAD_DIM; d++) {
+                int at = kv_head * HEAD_DIM + d;
+                state.key_work[t][d] =
+                    f16(state.key_cache[layer][t][at]);
+                state.value_work[t][d] =
+                    f16(state.value_cache[layer][t][at]);
+            }
+        }
+        for(int query = 0; query < HEADS / KV_HEADS; query++) {
+            int head = kv_head * (HEADS / KV_HEADS) + query;
+            float max_score = -1e30f, denom = 0.0f;
+            for(int t = 0; t <= position; t++) {
+                float sum = 0.0f;
+                for(int d = 0; d < HEAD_DIM; d++)
+                    sum += query_values[head * HEAD_DIM + d] *
+                        state.key_work[t][d];
+                scores[t] = sum / assets.attention_denominator;
+                if(scores[t] > max_score) max_score = scores[t];
+            }
+            for(int t = 0; t <= position; t++) {
+                scores[t] = expf(scores[t] - max_score);
+                denom += scores[t];
+            }
+            for(int t = 0; t <= position; t++) scores[t] /= denom;
+            for(int d = 0; d < HEAD_DIM; d++) {
+                float sum = 0.0f;
+                for(int t = 0; t <= position; t++)
+                    sum += scores[t] * state.value_work[t][d];
+                output[head * HEAD_DIM + d] = sum;
+            }
+        }
+    }
+}
+#endif
 
 static int forward_begin(int fd, int token, int kind)
 {
@@ -867,8 +1264,8 @@ static int forward_microstep(int fd)
 {
 #ifndef CASIOLLM_NANOLM_HYPER
     uint8_t norms[HIDDEN * 2];
-#endif
     float scores[MAX_CONTEXT];
+#endif
     int layer = state.forward_layer;
     int index = 1 + layer * 9;
     int result;
@@ -930,44 +1327,7 @@ static int forward_microstep(int fd)
                 state.value_cache[layer][state.position][i] = to_f16(state.v[i]);
             }
 #ifdef CASIOLLM_NANOLM_HYPER
-            for(int kv_head = 0; kv_head < KV_HEADS; kv_head++) {
-                for(int t = 0; t <= state.position; t++) {
-                    for(int d = 0; d < HEAD_DIM; d++) {
-                        int at = kv_head * HEAD_DIM + d;
-                        state.key_work[t][d] =
-                            f16(state.key_cache[layer][t][at]);
-                        state.value_work[t][d] =
-                            f16(state.value_cache[layer][t][at]);
-                    }
-                }
-                for(int query = 0; query < HEADS / KV_HEADS; query++) {
-                    int head = kv_head * (HEADS / KV_HEADS) + query;
-                    float max_score = -1e30f, denom = 0.0f;
-                    for(int t = 0; t <= state.position; t++) {
-                        float sum = 0.0f;
-                        for(int d = 0; d < HEAD_DIM; d++)
-                            sum += state.q[head * HEAD_DIM + d] *
-                                state.key_work[t][d];
-                        scores[t] = sum / sqrtf((float)HEAD_DIM);
-                        if(scores[t] > max_score) max_score = scores[t];
-                    }
-                    for(int t = 0; t <= state.position; t++) {
-                        scores[t] = expf(scores[t] - max_score);
-                        denom += scores[t];
-                    }
-                    /* Calculate each quotient once. The old implementation
-                       repeated the identical software-float division for all
-                       26 output dimensions. */
-                    for(int t = 0; t <= state.position; t++)
-                        scores[t] /= denom;
-                    for(int d = 0; d < HEAD_DIM; d++) {
-                        float sum = 0.0f;
-                        for(int t = 0; t <= state.position; t++)
-                            sum += scores[t] * state.value_work[t][d];
-                        state.attn[head * HEAD_DIM + d] = sum;
-                    }
-                }
-            }
+            attention_hyper_compute(layer, state.position, state.q, state.attn);
 #else
             for(int head = 0; head < HEADS; head++) {
                 int kv_head = head / (HEADS / KV_HEADS);
@@ -1034,8 +1394,12 @@ static int forward_microstep(int fd)
             return 0;
 
         case FWD_ACTIVATION: {
+#ifdef CASIOLLM_NANOLM_HYPER
+            int end = INTERMEDIATE;
+#else
             int end = state.activation_at + 64;
             if(end > INTERMEDIATE) end = INTERMEDIATE;
+#endif
             for(int i = state.activation_at; i < end; i++)
                 state.gate[i] = state.gate[i] /
                     (1.0f + expf(-state.gate[i])) * state.up[i];
@@ -1067,6 +1431,153 @@ static int forward_microstep(int fd)
             return -1;
     }
 }
+
+#if defined(CASIOLLM_NANOLM_BATCH_PREFILL) && defined(CASIOLLM_NANOLM_CG4)
+static int prefill_begin(int fd)
+{
+    int remaining = state.prompt_len - state.prompt_at;
+    int capacity = MAX_CONTEXT - state.position;
+    if(remaining <= 0) return 1;
+    if(capacity <= 0) {
+        set_error("Context limit reached");
+        return 0;
+    }
+    prefill.count = remaining;
+    if(prefill.count > PREFILL_BATCH) prefill.count = PREFILL_BATCH;
+    if(prefill.count > capacity) prefill.count = capacity;
+    for(int batch = 0; batch < prefill.count; batch++) {
+        int token = state.prompt[state.prompt_at + batch];
+        if(!embedding(fd, token, prefill.x[batch])) return 0;
+        prepare_rope_to(state.position + batch,
+            prefill.rope_cos[batch], prefill.rope_sin[batch]);
+    }
+    prefill.layer = 0;
+    prefill.stage = FWD_INPUT_NORM;
+    prefill.active = 1;
+    return 1;
+}
+
+/* One exact causal-prefill stage. Positions are processed together only for
+   matrix streaming; attention is still committed in causal order so the KV
+   state is identical to evaluating the same tokens one at a time. */
+static int prefill_microstep(int fd)
+{
+    int layer = prefill.layer;
+    int index = 1 + layer * 9;
+
+    switch(prefill.stage) {
+        case FWD_INPUT_NORM:
+            for(int batch = 0; batch < prefill.count; batch++) {
+                rms_norm_cached(prefill.xn[batch], prefill.x[batch],
+                    assets.norms[layer * 2]);
+                prefill.xq_scale[batch] = quantize_activation(
+                    prefill.xn[batch], HIDDEN, prefill.xq[batch]);
+            }
+            prefill.stage = FWD_Q;
+            return 0;
+
+        case FWD_Q:
+            if(!matvec_prefill_batch(fd, &assets.index[index + 1], HIDDEN,
+                HIDDEN, &prefill.q[0][0], HIDDEN, 0)) return -1;
+            prefill.stage = FWD_K;
+            return 0;
+
+        case FWD_K:
+            if(!matvec_prefill_batch(fd, &assets.index[index + 2], KV_DIM,
+                HIDDEN, &prefill.k[0][0], KV_DIM, 0)) return -1;
+            prefill.stage = FWD_V;
+            return 0;
+
+        case FWD_V:
+            if(!matvec_prefill_batch(fd, &assets.index[index + 3], KV_DIM,
+                HIDDEN, &prefill.v[0][0], KV_DIM, 0)) return -1;
+            prefill.stage = FWD_ATTENTION;
+            return 0;
+
+        case FWD_ATTENTION:
+            for(int batch = 0; batch < prefill.count; batch++) {
+                int position = state.position + batch;
+                apply_rope_values(prefill.q[batch], HEADS,
+                    prefill.rope_cos[batch], prefill.rope_sin[batch]);
+                apply_rope_values(prefill.k[batch], KV_HEADS,
+                    prefill.rope_cos[batch], prefill.rope_sin[batch]);
+                for(int i = 0; i < KV_DIM; i++) {
+                    state.key_cache[layer][position][i] =
+                        to_f16(prefill.k[batch][i]);
+                    state.value_cache[layer][position][i] =
+                        to_f16(prefill.v[batch][i]);
+                }
+                attention_hyper_compute(layer, position,
+                    prefill.q[batch], prefill.q[batch]);
+                prefill.xq_scale[batch] = quantize_activation(
+                    prefill.q[batch], HIDDEN, prefill.xq[batch]);
+            }
+            prefill.stage = FWD_O;
+            return 0;
+
+        case FWD_O:
+            if(!matvec_prefill_batch(fd, &assets.index[index + 4], HIDDEN,
+                HIDDEN, &prefill.xn[0][0], HIDDEN, 0)) return -1;
+            prefill.stage = FWD_POST_NORM;
+            return 0;
+
+        case FWD_POST_NORM:
+            for(int batch = 0; batch < prefill.count; batch++) {
+                for(int i = 0; i < HIDDEN; i++)
+                    prefill.x[batch][i] += prefill.xn[batch][i];
+                rms_norm_cached(prefill.xn[batch], prefill.x[batch],
+                    assets.norms[layer * 2 + 1]);
+                prefill.xq_scale[batch] = quantize_activation(
+                    prefill.xn[batch], HIDDEN, prefill.xq[batch]);
+            }
+            prefill.stage = FWD_GATE;
+            return 0;
+
+        case FWD_GATE:
+            if(!matvec_prefill_batch(fd, &assets.index[index + 6], INTERMEDIATE,
+                HIDDEN, &prefill.gate[0][0], INTERMEDIATE, 0)) return -1;
+            prefill.stage = FWD_UP;
+            return 0;
+
+        case FWD_UP:
+            if(!matvec_prefill_batch(fd, &assets.index[index + 7], INTERMEDIATE,
+                HIDDEN, &prefill.gate[0][0], INTERMEDIATE, 1)) return -1;
+            for(int batch = 0; batch < prefill.count; batch++)
+                prefill.xq_scale[batch] = quantize_activation(
+                    prefill.gate[batch], INTERMEDIATE, prefill.xq[batch]);
+            prefill.stage = FWD_DOWN;
+            return 0;
+
+        case FWD_DOWN:
+            if(!matvec_prefill_batch(fd, &assets.index[index + 8], HIDDEN,
+                INTERMEDIATE, &prefill.xn[0][0], HIDDEN, 0)) return -1;
+            prefill.stage = FWD_RESIDUAL;
+            return 0;
+
+        case FWD_RESIDUAL:
+            for(int batch = 0; batch < prefill.count; batch++)
+                for(int i = 0; i < HIDDEN; i++)
+                    prefill.x[batch][i] += prefill.xn[batch][i];
+            prefill.layer++;
+            prefill.stage = prefill.layer == LAYERS
+                ? FWD_FINAL_NORM : FWD_INPUT_NORM;
+            return 0;
+
+        case FWD_FINAL_NORM:
+            for(int batch = 0; batch < prefill.count; batch++)
+                rms_norm_cached(prefill.x[batch], prefill.x[batch],
+                    assets.norms[LAYERS * 2]);
+            memcpy(state.x, prefill.x[prefill.count - 1], sizeof(state.x));
+            state.position += prefill.count;
+            state.prompt_at += prefill.count;
+            prefill.active = 0;
+            return 1;
+
+        default:
+            return -1;
+    }
+}
+#endif
 
 #ifdef CASIOLLM_HOST_TOOLS
 bool nanolm_debug_build_prefix(void)
@@ -1180,21 +1691,34 @@ static int choose_token_microstep(int fd)
         int flat = begin * HIDDEN;
         int first_group;
         int groups;
-        int scale_bytes;
-        int quant_bytes;
-        uint8_t *scales;
-        uint8_t *quant;
+#ifdef CASIOLLM_NANOLM_CG4
+        int stream_bytes;
+#else
+        int scale_bytes, quant_bytes;
+        uint8_t *scales, *quant;
+#endif
 
         while(rows > 1) {
             first_group = flat >> 6;
             groups = ((flat + rows * HIDDEN - 1) >> 6) - first_group + 1;
+#ifdef CASIOLLM_NANOLM_CG4
+            stream_bytes = groups * CG4_GROUP_BYTES;
+            if(stream_bytes <= IO_BUFFER_BYTES) break;
+#else
             scale_bytes = groups * 2;
             quant_bytes = rows * HIDDEN / 2;
             if(scale_bytes + quant_bytes <= IO_BUFFER_BYTES) break;
+#endif
             rows--;
         }
         first_group = flat >> 6;
         groups = ((flat + rows * HIDDEN - 1) >> 6) - first_group + 1;
+#ifdef CASIOLLM_NANOLM_CG4
+        stream_bytes = groups * CG4_GROUP_BYTES;
+        if(stream_bytes > IO_BUFFER_BYTES ||
+           !read_at(fd, io_buffer, stream_bytes,
+               entry->a + (uint32_t)first_group * CG4_GROUP_BYTES)) return -1;
+#else
         scale_bytes = groups * 2;
         quant_bytes = rows * HIDDEN / 2;
         if(scale_bytes + quant_bytes > IO_BUFFER_BYTES) return -1;
@@ -1202,6 +1726,7 @@ static int choose_token_microstep(int fd)
         quant = io_buffer + scale_bytes;
         if(!read_at(fd, scales, scale_bytes, entry->a + first_group * 2) ||
            !read_at(fd, quant, quant_bytes, entry->b + flat / 2)) return -1;
+#endif
 
         for(int local = 0; local < rows; local++) {
             int row = begin + local;
@@ -1214,8 +1739,20 @@ static int choose_token_microstep(int fd)
                 int32_t subtotal = 0;
                 if(take > HIDDEN - col) take = HIDDEN - col;
 #ifdef CASIOLLM_NANOLM_HYPER
+#ifdef CASIOLLM_NANOLM_CG4
+                {
+                    uint8_t const *group_data = io_buffer +
+                        (group - first_group) * CG4_GROUP_BYTES;
+                    if(group - first_group + 1 < groups)
+                        prefetch_cg4(group_data + CG4_GROUP_BYTES);
+                    subtotal = dot_cg4_i16_exact(group_data + 4,
+                        element & 63, state.xq + col, take, unpacked);
+                    total += (float)subtotal * be_f32(group_data);
+                }
+#else
                 subtotal = dot_q4_i16_exact(quant, flat, element,
                     state.xq + col, take, unpacked);
+#endif
 #else
                 for(int j = 0; j < take; j++) {
                     int current = element + j;
@@ -1224,8 +1761,10 @@ static int choose_token_microstep(int fd)
                     subtotal += q * (int32_t)state.xq[col + j];
                 }
 #endif
+#ifndef CASIOLLM_NANOLM_CG4
                 total += (float)subtotal *
                     f16(le16(scales + (group - first_group) * 2));
+#endif
                 col += take;
             }
             if(total > state.choose_best) {
@@ -1349,6 +1888,17 @@ static int os_step_extreme_unit(int fd)
     int result;
     state.profile_units++;
 
+#if defined(CASIOLLM_NANOLM_BATCH_PREFILL) && defined(CASIOLLM_NANOLM_CG4)
+    if(prefill.active) {
+        result = prefill_microstep(fd);
+        if(result < 0) {
+            set_error("CG4 batched prefill error");
+            return -2;
+        }
+        return 0;
+    }
+#endif
+
     if(state.forward_active) {
         result = forward_microstep(fd);
         if(result < 0) { set_error("Q4 read or compute error"); return -2; }
@@ -1370,11 +1920,18 @@ static int os_step_extreme_unit(int fd)
     }
 
     if(state.prompt_at < state.prompt_len) {
+#if defined(CASIOLLM_NANOLM_BATCH_PREFILL) && defined(CASIOLLM_NANOLM_CG4)
+        if(!prefill_begin(fd)) {
+            if(!assets.error[0]) set_error("CG4 prefill start error");
+            return -2;
+        }
+#else
         int token = state.prompt[state.prompt_at++];
         if(!forward_begin(fd, token, FORWARD_PROMPT)) {
             set_error("Q4 read or context error");
             return -2;
         }
+#endif
         return 0;
     }
 
@@ -1395,19 +1952,30 @@ static int os_step_extreme_unit(int fd)
     return 0;
 }
 
-/* Coalesce several legacy microsteps under one OS visit and one file-open.
-   CASIOLLM_COALESCE_STEPS=8 is deliberately conservative until the physical
-   profiler tells us the resulting F6 latency. */
+/* Coalesce bounded microsteps under one OS visit. Ultra builds keep the model
+   descriptor open across visits, eliminating thousands of Fugue opens. */
 static int os_step_extreme(int ignored)
 {
     int fd;
+    int limit = CASIOLLM_COALESCE_STEPS;
     int result = 0;
     (void)ignored;
+#ifdef CASIOLLM_NANOLM_CG4
+    fd = assets.model_fd;
+    if(fd < 0) { set_error("NANOLM.CG4 is not open"); return -2; }
+#else
     fd = BFile_Open(u"\\\\fls0\\NANOLM.Q4", BFile_ReadOnly);
     if(fd < 0) { set_error("Missing NANOLM.Q4"); return -2; }
-    for(int i = 0; i < CASIOLLM_COALESCE_STEPS && result == 0; i++)
+#endif
+#ifdef CASIOLLM_NANOLM_BATCH_PREFILL
+    if(prefill.active || state.prompt_at < state.prompt_len)
+        limit = CASIOLLM_PREFILL_COALESCE_STEPS;
+#endif
+    for(int i = 0; i < limit && result == 0; i++)
         result = os_step_extreme_unit(fd);
+#ifndef CASIOLLM_NANOLM_CG4
     BFile_Close(fd);
+#endif
     return result;
 }
 #endif
@@ -1462,10 +2030,8 @@ int nanolm_step(int *token_id)
             state.first_token_recorded = 1;
         }
 #ifdef CASIOLLM_NANOLM_HYPER
-        snprintf(line, sizeof(line),
-            "TOKEN backend=NanoLM-Q4-20K n=%d id=%d pos=%d text=%.42s",
-            state.generated, *token_id, state.position, state.decoded);
-        log_event(line);
+        if(state.generated > 0 && state.generated <= MAX_RESPONSE_TOKENS)
+            state.token_trace[state.generated - 1] = *token_id;
 #endif
         return 1;
     }
@@ -1478,17 +2044,19 @@ int nanolm_step(int *token_id)
                 state.forward_layer, state.forward_stage);
             state.error_logged = 1;
             log_event(line);
+            log_token_trace();
         }
         else if(result == -1) {
             uint32_t total = elapsed_ticks(state.started_ticks, rtc_ticks());
             snprintf(line, sizeof(line),
-                "END backend=NanoLM-Q4-20K gen=%d pos=%d first_ms=%lu total_ms=%lu sw=%lu u=%lu",
-                state.generated, state.position,
+                "END backend=%s gen=%d pos=%d first_ms=%lu total_ms=%lu sw=%lu u=%lu",
+                NANOLM_BACKEND_LOG, state.generated, state.position,
                 (unsigned long)(state.first_token_ticks * 1000U / 128U),
                 (unsigned long)(total * 1000U / 128U),
                 (unsigned long)state.profile_switches,
                 (unsigned long)state.profile_units);
             log_event(line);
+            log_token_trace();
         }
         return -1;
     }
@@ -1504,14 +2072,15 @@ void nanolm_cancel(void)
     state.forward_active = 0;
     state.choosing = 0;
     snprintf(line, sizeof(line),
-        "CANCEL backend=NanoLM-Q4-20K p=%d/%d pos=%d l=%d s=%d gen=%d first_ms=%lu total_ms=%lu sw=%lu u=%lu",
-        state.prompt_at, state.prompt_len, state.position, state.forward_layer,
+        "CANCEL backend=%s p=%d/%d pos=%d l=%d s=%d gen=%d first_ms=%lu total_ms=%lu sw=%lu u=%lu",
+        NANOLM_BACKEND_LOG, state.prompt_at, state.prompt_len, state.position, state.forward_layer,
         state.forward_stage, state.generated,
         (unsigned long)(state.first_token_ticks * 1000U / 128U),
         (unsigned long)(total * 1000U / 128U),
         (unsigned long)state.profile_switches,
         (unsigned long)state.profile_units);
     log_event(line);
+    log_token_trace();
 }
 
 void nanolm_decode_token(int token_id, char *out, size_t out_size)
@@ -1527,6 +2096,8 @@ char const *nanolm_error(void) { return assets.error; }
 void nanolm_shutdown(void)
 {
     if(state.active) nanolm_cancel();
+    if(assets.model_fd >= 0)
+        (void)gint_world_switch(GINT_CALL(os_close_model, 0));
     free(io_buffer);
     io_buffer = NULL;
     memset(&state, 0, sizeof(state));

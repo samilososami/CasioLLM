@@ -445,6 +445,13 @@ static void stop_generation(void)
 
 static void start_prompt(void)
 {
+    /* EXE must not change the meaning of a prompt merely because the cursor
+       left one or more spaces at the end. NanoLM is unusually sensitive to
+       that distinction ("hi" and "hi " tokenize differently), so normalize
+       the submitted text before it is displayed, logged or tokenized. */
+    while(input_len > 0 && input[input_len - 1] == ' ') input_len--;
+    input[input_len] = '\0';
+    if(cursor > input_len) cursor = input_len;
     if(input_len == 0 || generation_active) return;
     generation_started_ticks = rtc_ticks();
     generation_timer_valid = true;

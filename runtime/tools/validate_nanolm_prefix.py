@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate that NANOLM.PFX is bound to the intended NanoLM Q4/index."""
+"""Validate that NANOLM.PFX is bound to the intended NanoLM model/index."""
 
 from __future__ import annotations
 
@@ -20,14 +20,14 @@ def main() -> int:
     digest = hashlib.sha256(args.q4.read_bytes()).digest()
     index = args.index.read_bytes()
     prefix = args.prefix.read_bytes()
-    if len(index) < 56 or index[:8] != b"NLMIDX02":
-        raise SystemExit("NANOLM.IDX is not a v2 index")
+    if len(index) < 56 or index[:8] not in (b"NLMIDX02", b"NLMIDX03"):
+        raise SystemExit("NANOLM.IDX is not a digest-bound v2/v3 index")
     if index[24:56] != digest:
-        raise SystemExit("NANOLM.IDX SHA-256 does not match NANOLM.Q4")
+        raise SystemExit("NANOLM.IDX SHA-256 does not match the model")
     if len(prefix) < 64 or prefix[:8] != b"NLMPFX01":
         raise SystemExit("invalid NANOLM.PFX header")
     if prefix[8:40] != digest:
-        raise SystemExit("NANOLM.PFX SHA-256 does not match NANOLM.Q4")
+        raise SystemExit("NANOLM.PFX SHA-256 does not match the model")
     prefix_tokens, layers, kv_dim, element_bytes, payload_bytes, token_hash = (
         struct.unpack_from("<IIIIII", prefix, 40)
     )
@@ -35,7 +35,8 @@ def main() -> int:
     if payload_bytes != expected or len(prefix) != 64 + payload_bytes:
         raise SystemExit("NANOLM.PFX payload size is inconsistent")
     print(json.dumps({
-        "q4_sha256": digest.hex(),
+        "model_sha256": digest.hex(),
+        "index_version": index[:8].decode("ascii"),
         "prefix_tokens": prefix_tokens,
         "layers": layers,
         "kv_dim": kv_dim,

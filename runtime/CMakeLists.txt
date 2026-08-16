@@ -6,9 +6,9 @@ include(GenerateG3A)
 find_package(Gint 2.9 REQUIRED)
 
 set(CASIOLLM_BACKEND "tinytalk" CACHE STRING
-  "Runtime to build: tinytalk, nanolm-legacy, nanolm-extreme, or nanolm-hyper")
+  "Runtime to build: tinytalk, nanolm-legacy, nanolm-extreme, nanolm-hyper, or nanolm-ultra")
 set_property(CACHE CASIOLLM_BACKEND PROPERTY STRINGS
-  tinytalk nanolm-legacy nanolm-extreme nanolm-hyper)
+  tinytalk nanolm-legacy nanolm-extreme nanolm-hyper nanolm-ultra)
 set(CASIOLLM_NANOLM_PROMPT "identity" CACHE STRING
   "NanoLM fixed prompt: identity or short")
 set_property(CACHE CASIOLLM_NANOLM_PROMPT PROPERTY STRINGS identity short)
@@ -58,13 +58,29 @@ elseif(CASIOLLM_BACKEND STREQUAL "nanolm-hyper")
     CASIOLLM_NANOLM_HYPER=1
     CASIOLLM_COALESCE_STEPS=8
     IO_BUFFER_BYTES=49152)
+elseif(CASIOLLM_BACKEND STREQUAL "nanolm-ultra")
+  set(CASIOLLM_RUNTIME src/nanolm.c)
+  set(CASIOLLM_OUTPUT "CasioLLM.g3a")
+  set(CASIOLLM_VERSION "0.10.0")
+  set(CASIOLLM_OPTIMIZATION -O3)
+  add_compile_definitions(
+    CASIOLLM_BACKEND_NANOLM=1
+    CASIOLLM_NANOLM_EXTREME=1
+    CASIOLLM_NANOLM_SHORT_PROMPT=1
+    CASIOLLM_NANOLM_SHORT_IDENTITY=1
+    CASIOLLM_NANOLM_HYPER=1
+    CASIOLLM_NANOLM_CG4=1
+    CASIOLLM_NANOLM_BATCH_PREFILL=1
+    CASIOLLM_PREFILL_COALESCE_STEPS=11
+    CASIOLLM_COALESCE_STEPS=64
+    IO_BUFFER_BYTES=32768)
 else()
   message(FATAL_ERROR "Unknown CASIOLLM_BACKEND=${CASIOLLM_BACKEND}")
 endif()
 
 add_executable(llm src/main.c ${CASIOLLM_RUNTIME})
 target_compile_options(llm PRIVATE -Wall -Wextra -Werror
-  ${CASIOLLM_OPTIMIZATION} -g -flto)
+  ${CASIOLLM_OPTIMIZATION} -fno-math-errno -g -flto)
 target_link_libraries(llm Gint::Gint m)
 
 # The visible title is intentionally short: the CG-50 menu only allows 8 bytes.

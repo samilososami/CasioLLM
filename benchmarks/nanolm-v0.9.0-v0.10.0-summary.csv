@@ -1,0 +1,13 @@
+prompt,v0.9_first_ms,v0.9_total_ms,v0.10_first_ms,v0.10_total_ms,first_reduction_percent,total_reduction_percent
+Hello! How are you today?,242,1007,85,664,64.9,34.1
+I have something important to tell you.,304,960,117,640,61.5,33.3
+I feel sad today. What could I do?,296,960,101,617,65.9,35.7
+What is a dog?,187,960,54,664,71.1,30.8
+What is a table?,195,976,62,664,68.2,32.0
+What is the capital of France?,242,406,101,226,58.3,44.3
+What is water?,171,960,54,687,68.4,28.4
+What is 2 plus 2?,242,476,78,257,67.8,46.0
+Why do people sleep?,210,992,62,718,70.5,27.6
+Explain rain in simple words.,242,984,93,671,61.6,31.8
+Tell me a joke.,187,968,62,671,66.8,30.7
+Which planet do we live on?,257,1046,93,687,63.8,34.3

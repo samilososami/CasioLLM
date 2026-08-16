@@ -1,0 +1,33 @@
+CasioLLM NanoLM CG4 v0.10.0 build verification
+Date: 2026-08-16
+
+fxgxa header:
+  Signature/checksum/file-size/footer checks: OK
+  Program name: CasioLLM
+  Internal name: @CASIOLLM
+  Version: 0.10.0
+  Build date: 2026.0816.2158
+
+SH binary:
+  text: 92268 bytes
+  data: 512 bytes
+  bss: 446704 bytes
+  exact MAC.W instructions found by disassembly: 370
+  PREF instructions found by disassembly: 21
+
+Assets:
+  Prefix format: valid
+  Index version: NLMIDX03
+  Prefix positions: 20
+  Layers: 12
+  KV dimension: 104
+  Prefix bytes: 99904
+  Model SHA-256: 85c06841c9643dcc4f688003df47a6a9aa187f87eebdd54f8f415410d6db4636
+
+Runtime regression:
+  Exact output/token matches: 50/50
+  v0.9.0 aggregate host time: 46.09548863997043 seconds
+  v0.10.0 aggregate host time: 30.79118226202263 seconds
+  ASan/UBSan shutdown/reopen: 3/3
+  ASan/UBSan first-token cancel/reopen: 3/3
+

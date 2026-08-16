@@ -32,7 +32,8 @@ static int path_has(uint16_t const *path, char const *needle)
 
 static char const *resolve(uint16_t const *path)
 {
-    if(path_has(path, "NANOLM.Q4")) return q4_path;
+    if(path_has(path, "NANOLM.Q4") || path_has(path, "NANOLM.CG4"))
+        return q4_path;
     if(path_has(path, "NANOLM.IDX")) return idx_path;
     if(path_has(path, "NANOLM.TOK")) return tok_path;
     if(path_has(path, "NANOLM.TRI")) return tri_path;
@@ -139,7 +140,7 @@ int main(int argc, char **argv)
     int stop_after = 0;
     if(argc != 8) {
         fprintf(stderr,
-            "usage: %s NANOLM.Q4 NANOLM.IDX NANOLM.TOK NANOLM.TRI NANOLM.PFX NANOLM.LOG prompt\n",
+            "usage: %s NANOLM.Q4-or-CG4 NANOLM.IDX NANOLM.TOK NANOLM.TRI NANOLM.PFX NANOLM.LOG prompt\n",
             argv[0]);
         return 2;
     }

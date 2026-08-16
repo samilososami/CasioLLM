@@ -1,0 +1,9 @@
+START backend=NanoLM-CG4-Q4-20K-B4 p=10 cached=20 utok=4 uhash=a92b1521 user=what is water? 
+CANCEL backend=NanoLM-CG4-Q4-20K-B4 p=10/10 pos=30 l=0 s=0 gen=1 first_ms=1007 total_ms=1007 sw=38 u=410
+TOKENS 1-1 ids=7376 
+START backend=NanoLM-CG4-Q4-20K-B4 p=10 cached=20 utok=4 uhash=a92b1521 user=what is water? 
+CANCEL backend=NanoLM-CG4-Q4-20K-B4 p=10/10 pos=30 l=0 s=0 gen=1 first_ms=992 total_ms=992 sw=38 u=410
+TOKENS 1-1 ids=7376 
+START backend=NanoLM-CG4-Q4-20K-B4 p=10 cached=20 utok=4 uhash=a92b1521 user=what is water? 
+CANCEL backend=NanoLM-CG4-Q4-20K-B4 p=10/10 pos=30 l=0 s=0 gen=1 first_ms=992 total_ms=992 sw=38 u=410
+TOKENS 1-1 ids=7376 
